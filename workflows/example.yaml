@@ -3,6 +3,7 @@ defaults:
   sandbox: workspace-write
 steps:
   - id: inspect
+    role: analyst
     prompt: |
       Inspect the repository and summarize the current project structure.
 
@@ -10,6 +11,7 @@ steps:
       status "ok".
 
   - id: plan
+    role: planner
     prompt: |
       Propose an implementation plan for a workflow runner that executes
       sequential Codex steps from YAML.
@@ -17,6 +19,7 @@ steps:
       Return status "fail" if the repository state prevents meaningful work.
 
   - id: implement
+    role: implementer
     prompt: |
       Implement the planned workflow runner.
 

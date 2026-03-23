@@ -34,15 +34,17 @@ class WorkflowRunner:
         workflow_path: str,
         schema_path: str,
         codex_command: str,
+        myteam_command: str,
         artifacts_dir: str | None,
     ) -> None:
         self.workflow_path = Path(workflow_path).expanduser().resolve()
         self.schema_path = Path(schema_path).expanduser().resolve()
         self.codex_command = codex_command
+        self.myteam_command = myteam_command
         self.invocation_dir = Path.cwd()
-        self.workflow_dir = self.workflow_path.parent
         self.artifacts_root = self._resolve_artifacts_root(artifacts_dir)
         self.run_dir = self._build_run_dir()
+        self.role_cache: dict[str, str] = {}
 
     def run(self) -> int:
         workflow = self._load_workflow()
@@ -97,6 +99,7 @@ class WorkflowRunner:
 
             step_id = step.get("id")
             prompt = step.get("prompt")
+            role = step.get("role")
 
             if not isinstance(step_id, str) or not step_id:
                 raise WorkflowError("Each step requires a non-empty `id`")
@@ -104,6 +107,8 @@ class WorkflowRunner:
                 raise WorkflowError(f"Duplicate step id: {step_id}")
             if not isinstance(prompt, str) or not prompt.strip():
                 raise WorkflowError(f"Step {step_id} requires a non-empty `prompt`")
+            if role is not None and (not isinstance(role, str) or not role.strip()):
+                raise WorkflowError(f"Step {step_id} role must be a non-empty string")
 
             ids.add(step_id)
 
@@ -121,14 +126,28 @@ class WorkflowRunner:
         step_dir = self.run_dir / f"{step_number:02d}-{step_id}"
         step_dir.mkdir(parents=True, exist_ok=True)
 
-        prompt = self._build_prompt(step_id, step["prompt"], previous_handoff)
+        role_name = step.get("role")
+        role_definition = None
+        if role_name:
+            role_definition = self._resolve_role_definition(role_name, step_id)
+
+        prompt = self._build_prompt(
+            step_id,
+            step["prompt"],
+            previous_handoff,
+            role_name,
+            role_definition,
+        )
         prompt_path = step_dir / "prompt.txt"
         output_path = step_dir / "result.json"
         stdout_path = step_dir / "stdout.txt"
         stderr_path = step_dir / "stderr.txt"
         command_path = step_dir / "command.txt"
+        role_path = step_dir / "role.txt"
 
         prompt_path.write_text(prompt, encoding="utf-8")
+        if role_definition is not None:
+            role_path.write_text(role_definition, encoding="utf-8")
 
         command = self._build_command(step, defaults, output_path)
         command_path.write_text(shlex.join(command), encoding="utf-8")
@@ -139,7 +158,7 @@ class WorkflowRunner:
                 input=prompt,
                 text=True,
                 capture_output=True,
-                cwd=self.workflow_dir,
+                cwd=self.invocation_dir,
                 check=False,
             )
         except FileNotFoundError as exc:
@@ -163,9 +182,23 @@ class WorkflowRunner:
         return parsed
 
     def _build_prompt(
-        self, step_id: str, step_prompt: str, previous_handoff: str | None
+        self,
+        step_id: str,
+        step_prompt: str,
+        previous_handoff: str | None,
+        role_name: str | None,
+        role_definition: str | None,
     ) -> str:
         lines = [f"You are executing workflow step `{step_id}`.", ""]
+        if role_name and role_definition:
+            lines.extend(
+                [
+                    f"Assume the `{role_name}` role from myteam.",
+                    "Role instructions:",
+                    role_definition.rstrip(),
+                    "",
+                ]
+            )
         if previous_handoff:
             lines.extend(
                 [
@@ -217,10 +250,59 @@ class WorkflowRunner:
         command.append("-")
         return command
 
+    def _resolve_role_definition(self, role_name: str, step_id: str) -> str:
+        cached = self.role_cache.get(role_name)
+        if cached is not None:
+            return cached
+
+        command = self._normalized_myteam_command_parts()
+        command.extend(["get", "role", "--role", role_name])
+
+        try:
+            result = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                cwd=self.invocation_dir,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise WorkflowError(
+                f"Step {step_id} could not start myteam command {command[0]}: {exc}"
+            ) from exc
+
+        if result.returncode != 0:
+            stderr = result.stderr.strip() or result.stdout.strip() or "unknown error"
+            raise WorkflowError(
+                f"Step {step_id} could not resolve role `{role_name}` via myteam: {stderr}"
+            )
+
+        role_definition = result.stdout.strip()
+        if not role_definition:
+            raise WorkflowError(
+                f"Step {step_id} resolved role `{role_name}` but received empty instructions"
+            )
+
+        self.role_cache[role_name] = role_definition
+        return role_definition
+
     def _normalized_command_parts(self) -> list[str]:
         parts = shlex.split(self.codex_command)
         if not parts:
             raise WorkflowError("Codex command cannot be empty")
+
+        executable = Path(parts[0]).expanduser()
+        if "/" in parts[0]:
+            if not executable.is_absolute():
+                executable = (self.invocation_dir / executable).resolve()
+            parts[0] = str(executable)
+
+        return parts
+
+    def _normalized_myteam_command_parts(self) -> list[str]:
+        parts = shlex.split(self.myteam_command)
+        if not parts:
+            raise WorkflowError("myteam command cannot be empty")
 
         executable = Path(parts[0]).expanduser()
         if "/" in parts[0]:
@@ -293,6 +375,11 @@ def parse_args() -> argparse.Namespace:
         help="Command used to invoke Codex",
     )
     parser.add_argument(
+        "--myteam-command",
+        default="myteam",
+        help="Command used to resolve role definitions from myteam",
+    )
+    parser.add_argument(
         "--artifacts-dir",
         help=(
             "Directory where workflow run artifacts are stored. "
@@ -308,6 +395,7 @@ def main() -> int:
         workflow_path=args.workflow_file,
         schema_path=args.schema,
         codex_command=args.codex_command,
+        myteam_command=args.myteam_command,
         artifacts_dir=args.artifacts_dir,
     )
     return runner.run()

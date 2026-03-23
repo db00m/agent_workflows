@@ -15,6 +15,9 @@ structured response that matches the shared contract below:
 If any step returns `status: "fail"`, the runner stops immediately and exits
 non-zero.
 
+The workflow file can live anywhere, but each `codex exec` step runs in the
+directory where you launch the runner.
+
 ## Workflow YAML
 
 The top-level format is:
@@ -43,6 +46,7 @@ Supported fields:
 - `defaults.profile`: optional `codex exec --profile`
 - `steps`: ordered list of steps
 - `steps[].id`: required unique step identifier
+- `steps[].role`: optional role name resolved with `myteam get role --role NAME`
 - `steps[].prompt`: required instructions for that step
 - `steps[].model`: optional per-step model override
 - `steps[].sandbox`: optional per-step sandbox override
@@ -53,6 +57,7 @@ Supported fields:
 Before each step, the runner wraps the step prompt with:
 
 - the workflow step id
+- the resolved `myteam` role instructions when `role` is present
 - the previous step's `handoff_summary` when present
 - the required output contract
 
@@ -65,6 +70,7 @@ to ad hoc tool behavior.
 - `schemas/step-output.schema.json`: shared step output contract
 - `workflows/example.yaml`: example workflow
 - `scripts/mock_codex_exec.sh`: local test shim for verification
+- `scripts/mock_myteam.sh`: local `myteam` shim for verification
 
 ## Usage
 
@@ -73,6 +79,9 @@ Run a real workflow:
 ```bash
 python3 scripts/run_workflow.py workflows/example.yaml
 ```
+
+That command reads `workflows/example.yaml`, but the workflow itself runs in the
+current shell directory.
 
 Choose a different schema file:
 
@@ -83,7 +92,7 @@ python3 scripts/run_workflow.py workflows/example.yaml --schema schemas/step-out
 Test the runner without calling the live Codex API:
 
 ```bash
-python3 scripts/run_workflow.py workflows/example.yaml --codex-command ./scripts/mock_codex_exec.sh
+python3 scripts/run_workflow.py workflows/example.yaml --codex-command ./scripts/mock_codex_exec.sh --myteam-command ./scripts/mock_myteam.sh
 ```
 
 By default, artifacts are written under `.codex-workflow/runs/<timestamp>/` in
@@ -98,6 +107,7 @@ python3 scripts/run_workflow.py workflows/example.yaml --artifacts-dir /tmp/code
 
 For each step, the runner stores:
 
+- the resolved role instructions, if the step defines `role`
 - the fully constructed prompt
 - stdout and stderr
 - the parsed JSON result
