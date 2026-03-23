@@ -25,22 +25,34 @@ The top-level format is:
 ```yaml
 version: 1
 defaults:
-  model: gpt-5.2
   sandbox: workspace-write
-  profile: default
 steps:
   - id: inspect
+    role: analyst
     prompt: |
-      Inspect the repository and identify the main modules.
+      Inspect the repository and summarize the current project structure.
+
+      If the repository is empty, say so in the handoff summary and return
+      status "ok".
+  - id: plan
+    role: planner
+    prompt: |
+      Propose an implementation plan for a workflow runner that executes
+      sequential Codex steps from YAML.
+
+      Return status "fail" if the repository state prevents meaningful work.
   - id: implement
-    model: gpt-5.4
+    role: implementer
     prompt: |
-      Implement the requested feature.
+      Implement the planned workflow runner.
+
+      Return status "fail" if the implementation cannot be completed safely.
 ```
 
 Supported fields:
 
 - `version`: currently `1`
+- `defaults`: optional mapping of step defaults
 - `defaults.model`: optional `codex exec --model`
 - `defaults.sandbox`: optional `codex exec --sandbox`
 - `defaults.profile`: optional `codex exec --profile`
