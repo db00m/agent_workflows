@@ -1,0 +1,23 @@
+version: 1
+defaults:
+  sandbox: workspace-write
+steps:
+  - id: inspect
+    prompt: |
+      Inspect the repository and summarize the current project structure.
+
+      If the repository is empty, say so in the handoff summary and return
+      status "ok".
+
+  - id: plan
+    prompt: |
+      Propose an implementation plan for a workflow runner that executes
+      sequential Codex steps from YAML.
+
+      Return status "fail" if the repository state prevents meaningful work.
+
+  - id: implement
+    prompt: |
+      Implement the planned workflow runner.
+
+      Return status "fail" if the implementation cannot be completed safely.

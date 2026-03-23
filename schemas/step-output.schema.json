@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["ok", "fail"]
+    },
+    "handoff_summary": {
+      "type": "string"
+    }
+  },
+  "required": ["status", "handoff_summary"],
+  "additionalProperties": false
+}
