@@ -256,7 +256,7 @@ class WorkflowRunner:
             return cached
 
         command = self._normalized_myteam_command_parts()
-        command.extend(["get", "role", "--role", role_name])
+        command.extend(["get", "role", role_name])
 
         try:
             result = subprocess.run(
