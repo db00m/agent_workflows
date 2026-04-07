@@ -1,88 +1,109 @@
 # Codex Workflow Prototype
 
-This repo contains a small Python workflow runner for `codex exec`.
+This repo contains an interactive Python workflow runner for `codex app-server`.
 
-The workflow is defined in YAML. Each step runs in order. A step must return a
-structured response that matches the shared contract below:
+The workflow is defined in YAML. Each step starts an interactive Codex session.
+You can keep talking to the step until you enter one of the reserved workflow
+commands:
 
-```json
-{
-  "status": "ok | fail",
-  "handoff_summary": "short summary for the next step"
-}
-```
+- `/done`: finalize the current step and move to the next step
+- `/retry`: restart the current step from a clean session
+- `/fail`: stop the workflow immediately
 
-If any step returns `status: "fail"`, the runner stops immediately and exits
-non-zero.
-
-The workflow file can live anywhere, but each `codex exec` step runs in the
-directory where you launch the runner.
+When a step is finalized, the runner asks Codex to return JSON matching that
+step's declared `output` shape. Later steps can reference fields from earlier
+outputs using `$ref` inside `additional_context`.
 
 ## Workflow YAML
 
 The top-level format is:
 
 ```yaml
-version: 1
-defaults:
-  sandbox: workspace-write
+version: 2
 steps:
   - id: inspect
-    role: analyst
+    role: inspector
+    model: gpt-5-codex
     prompt: |
-      Inspect the repository and summarize the current project structure.
+      Inspect the repository and determine whether the workflow is valid.
+    output:
+      valid: boolean
+      result: string
 
-      If the repository is empty, say so in the handoff summary and return
-      status "ok".
-  - id: plan
-    role: planner
+  - id: summarize
+    role: summarizer
     prompt: |
-      Propose an implementation plan for a workflow runner that executes
-      sequential Codex steps from YAML.
-
-      Return status "fail" if the repository state prevents meaningful work.
-  - id: implement
-    role: implementer
-    prompt: |
-      Implement the planned workflow runner.
-
-      Return status "fail" if the implementation cannot be completed safely.
+      Summarize the inspection result for the user.
+    additional_context:
+      valid:
+        $ref: steps.inspect.output.valid
+      text:
+        $ref: steps.inspect.output.result
+    output:
+      summary: string
 ```
 
 Supported fields:
 
-- `version`: currently `1`
-- `defaults`: optional mapping of step defaults
-- `defaults.model`: optional `codex exec --model`
-- `defaults.sandbox`: optional `codex exec --sandbox`
-- `defaults.profile`: optional `codex exec --profile`
+- `version`: currently `2`
 - `steps`: ordered list of steps
 - `steps[].id`: required unique step identifier
-- `steps[].role`: optional role name resolved with `myteam get role --role NAME`
-- `steps[].prompt`: required instructions for that step
+- `steps[].role`: required role name
+- `steps[].prompt`: required task instructions
 - `steps[].model`: optional per-step model override
-- `steps[].sandbox`: optional per-step sandbox override
-- `steps[].profile`: optional per-step profile override
+- `steps[].additional_context`: optional structured context
+- `steps[].output`: required output declaration written in YAML
 
-## Handoff Behavior
+Output declarations support:
 
-Before each step, the runner wraps the step prompt with:
+- scalar type names: `string`, `boolean`, `number`, `integer`, `null`, `any`
+- nested objects via YAML mappings
+- arrays via a single-item YAML list, for example `tags: [string]`
 
-- the workflow step id
-- the resolved `myteam` role instructions when `role` is present
-- the previous step's `handoff_summary` when present
-- the required output contract
+## References
 
-That gives each agent a clean handoff channel without exposing workflow control
-to ad hoc tool behavior.
+References use explicit `$ref` objects:
 
-## Files
+```yaml
+additional_context:
+  text:
+    $ref: steps.inspect.output.result
+```
 
-- `scripts/run_workflow.py`: workflow runner
-- `schemas/step-output.schema.json`: shared step output contract
-- `workflows/example.yaml`: example workflow
-- `scripts/mock_codex_exec.sh`: local test shim for verification
-- `scripts/mock_myteam.sh`: local `myteam` shim for verification
+Rules:
+
+- references may only target earlier steps
+- the stable reference root is `steps.<step_id>.output`
+- invalid references are rejected before execution starts
+
+## Prompt And Session Behavior
+
+Each step's initial message is constructed from:
+
+- `role: <role>; task: <prompt>`
+- the resolved `additional_context`
+
+The runner does not resolve `myteam` roles itself. The agent is expected to use
+`myteam` directly during the interactive session if it needs role details.
+
+## Artifacts
+
+Artifacts are written under `.codex-workflow/runs/<timestamp>/` in the
+directory where you launch the runner.
+
+For each step attempt, the runner stores:
+
+- app-server protocol traffic
+- app-server stderr
+- the thread start request and response
+- each turn request
+- the initial prompt
+- the resolved additional context
+- the reference resolution record
+- a human-readable transcript
+- the finalized JSON result, when the step completes
+
+Retries create a new `attempt-XX` directory for that step.
 
 ## Usage
 
@@ -92,35 +113,23 @@ Run a real workflow:
 python3 scripts/run_workflow.py workflows/example.yaml
 ```
 
-That command reads `workflows/example.yaml`, but the workflow itself runs in the
-current shell directory.
-
-Choose a different schema file:
+Test with the local mock app server:
 
 ```bash
-python3 scripts/run_workflow.py workflows/example.yaml --schema schemas/step-output.schema.json
+python3 scripts/run_workflow.py workflows/example.yaml --codex-command "python3 scripts/mock_codex_app_server.py"
 ```
 
-Test the runner without calling the live Codex API:
+Then interact with each step and use `/done` to advance.
 
-```bash
-python3 scripts/run_workflow.py workflows/example.yaml --codex-command ./scripts/mock_codex_exec.sh --myteam-command ./scripts/mock_myteam.sh
-```
-
-By default, artifacts are written under `.codex-workflow/runs/<timestamp>/` in
-the directory where you launch the runner, not next to the workflow file. This
-keeps run state out of the Codex workspace being modified by the workflow.
-
-You can override that location:
+You can override the artifacts directory:
 
 ```bash
 python3 scripts/run_workflow.py workflows/example.yaml --artifacts-dir /tmp/codex-workflow-artifacts
 ```
 
-For each step, the runner stores:
+## Files
 
-- the resolved role instructions, if the step defines `role`
-- the fully constructed prompt
-- stdout and stderr
-- the parsed JSON result
-- the exact command used
+- `scripts/run_workflow.py`: workflow runner
+- `scripts/mock_codex_app_server.py`: local app-server mock for verification
+- `workflow_server.md`: design notes for the app-server-based workflow model
+- `workflows/example.yaml`: example workflow

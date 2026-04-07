@@ -1,26 +1,22 @@
-version: 1
-defaults:
-  sandbox: workspace-write
+version: 2
 steps:
   - id: inspect
-    role: analyst
+    role: inspector
+    model: gpt-5-codex
     prompt: |
-      Inspect the repository and summarize the current project structure.
+      Inspect the repository and determine whether the workflow structure looks valid.
+    output:
+      valid: boolean
+      result: string
 
-      If the repository is empty, say so in the handoff summary and return
-      status "ok".
-
-  - id: plan
-    role: planner
+  - id: summarize
+    role: summarizer
     prompt: |
-      Propose an implementation plan for a workflow runner that executes
-      sequential Codex steps from YAML.
-
-      Return status "fail" if the repository state prevents meaningful work.
-
-  - id: implement
-    role: implementer
-    prompt: |
-      Implement the planned workflow runner.
-
-      Return status "fail" if the implementation cannot be completed safely.
+      Summarize the inspection result for the user.
+    additional_context:
+      valid:
+        $ref: steps.inspect.output.valid
+      text:
+        $ref: steps.inspect.output.result
+    output:
+      summary: string
