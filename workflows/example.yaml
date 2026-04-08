@@ -3,6 +3,7 @@ steps:
   - id: inspect
     role: inspector
     model: gpt-5-codex
+    automatic: true
     prompt: |
       Inspect the repository and determine whether the workflow structure looks valid.
     output:

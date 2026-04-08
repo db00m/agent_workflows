@@ -1,12 +1,13 @@
 # Server Version
 
-This version of workflows uses `codex app-server` instead of `codex exec` so
-each workflow step can run as an interactive Codex session.
+This version of workflows supports both `codex app-server` and `codex exec`.
+Interactive steps use `codex app-server`. Automatic steps use `codex exec`.
 
-The workflow is still ordered and step-based. The runner starts the first step
-as an interactive session. When the user decides the step is complete, they use
-`/done` to end that session and advance to the next step. The completed step
-must then produce JSON that matches the output format defined for that step in
+The workflow is still ordered and step-based. Interactive steps start as
+interactive sessions. When the user decides the step is complete, they use
+`/done` to end that session and advance to the next step. Automatic steps run
+once and immediately return their finalized JSON. In both modes, the completed
+step must produce JSON that matches the output format defined for that step in
 the workflow YAML.
 
 The workflow no longer depends on a shared external output schema file. The only
@@ -35,6 +36,7 @@ steps:
   - id: inspect
     model: gpt-5-codex
     role: inspector
+    automatic: true
     prompt: Inspect the repository and determine whether the workflow is valid.
     output:
       valid: boolean
@@ -60,6 +62,7 @@ Supported fields:
 - `steps[].role`: required role name to provide to the agent
 - `steps[].prompt`: required task instructions for the step
 - `steps[].model`: optional model override for the step
+- `steps[].automatic`: optional boolean; when `true`, the step runs via `codex exec`
 - `steps[].additional_context`: optional structured context injected into the step
 - `steps[].output`: required JSON output shape for the step, written in YAML
 
@@ -112,6 +115,10 @@ The initial prompt for a step should be constructed in this form:
 
 The runner should also provide the resolved `additional_context` for the step.
 
+Interactive steps should be told to collaborate until the user finalizes the
+step. Automatic steps should be told to complete the task in one pass and
+return only the final JSON object.
+
 The runner should not resolve `myteam` roles itself. Agents should use the
 `myteam` CLI directly if they need role details during the session. This keeps
 workflow orchestration lighter and gives the agent freedom to use `myteam` in
@@ -135,11 +142,14 @@ Reference validation should happen before workflow execution starts.
 
 For each step, the runner should store:
 
-- the raw interactive transcript
+- a transcript of the step input and final output
 - the finalized JSON result
 - the resolved additional context passed into the step
 - the exact prompt or initialization payload used to start the step
 - a record of reference resolution for that step
+
+Interactive steps should also store app-server protocol artifacts. Automatic
+steps should also store the exec invocation, schema file, stdout, and stderr.
 
 These artifacts are important for debugging because later steps may depend on
 specific fields from earlier step outputs.

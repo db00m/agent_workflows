@@ -27,7 +27,15 @@ except ModuleNotFoundError as exc:
 
 
 SCALAR_TYPES = {"string", "boolean", "number", "integer", "null", "any"}
-STEP_KEYS = {"id", "role", "prompt", "model", "additional_context", "output"}
+STEP_KEYS = {
+    "id",
+    "role",
+    "prompt",
+    "model",
+    "automatic",
+    "additional_context",
+    "output",
+}
 TOP_LEVEL_KEYS = {"version", "steps"}
 APP_SERVER_EOF = object()
 
@@ -341,10 +349,14 @@ class WorkflowRunner:
         self,
         workflow_path: str,
         codex_command: str,
+        codex_exec_command: str | None,
         artifacts_dir: str | None,
     ) -> None:
         self.workflow_path = Path(workflow_path).expanduser().resolve()
         self.codex_command = codex_command
+        self.codex_exec_command = codex_exec_command or self._derive_exec_command(
+            codex_command
+        )
         self.invocation_dir = Path.cwd()
         self.artifacts_root = self._resolve_artifacts_root(artifacts_dir)
         self.run_dir = self._build_run_dir()
@@ -358,6 +370,11 @@ class WorkflowRunner:
         completed_outputs: dict[str, Any] = {}
 
         for index, step in enumerate(workflow["steps"], start=1):
+            self._print_step_header(
+                step_number=index,
+                step_id=step["id"],
+                automatic=step["_automatic"],
+            )
             while True:
                 try:
                     result = self._run_step(
@@ -418,6 +435,7 @@ class WorkflowRunner:
             role = step.get("role")
             prompt = step.get("prompt")
             output = step.get("output")
+            automatic = step.get("automatic", False)
 
             if not isinstance(step_id, str) or not step_id.strip():
                 raise WorkflowError("Each step requires a non-empty `id`")
@@ -427,6 +445,8 @@ class WorkflowRunner:
                 raise WorkflowError(f"Step {step_id} requires a non-empty `role`")
             if not isinstance(prompt, str) or not prompt.strip():
                 raise WorkflowError(f"Step {step_id} requires a non-empty `prompt`")
+            if type(automatic) is not bool:
+                raise WorkflowError(f"Step {step_id} `automatic` must be a boolean")
             if output is None:
                 raise WorkflowError(f"Step {step_id} requires an `output` declaration")
 
@@ -447,6 +467,7 @@ class WorkflowRunner:
 
             step["_normalized_output"] = normalized_output
             step["_output_schema"] = self._shape_to_json_schema(normalized_output)
+            step["_automatic"] = automatic
             declared_outputs[step_id] = normalized_output
             seen_ids.add(step_id)
 
@@ -483,13 +504,34 @@ class WorkflowRunner:
         initial_prompt = self._build_initial_message(step, resolved_context)
         (attempt_dir / "initial_prompt.txt").write_text(initial_prompt, encoding="utf-8")
 
+        if step["_automatic"]:
+            return self._run_automatic_step(
+                step=step,
+                attempt_dir=attempt_dir,
+                initial_prompt=initial_prompt,
+            )
+
+        return self._run_interactive_step(
+            step=step,
+            attempt_dir=attempt_dir,
+            initial_prompt=initial_prompt,
+        )
+
+    def _run_interactive_step(
+        self,
+        step: dict[str, Any],
+        attempt_dir: Path,
+        initial_prompt: str,
+    ) -> Any:
+        step_id = step["id"]
+
         protocol_path = attempt_dir / "protocol.jsonl"
         stderr_path = attempt_dir / "stderr.txt"
         transcript_path = attempt_dir / "transcript.txt"
         transcript_lines: list[str] = []
 
         with AppServerClient(
-            command=self._normalized_codex_command_parts(),
+            command=self._normalized_command_parts(self.codex_command),
             cwd=self.invocation_dir,
             protocol_path=protocol_path,
             stderr_path=stderr_path,
@@ -553,6 +595,123 @@ class WorkflowRunner:
                 )
                 self._record_agent_messages(transcript_lines, turn.agent_messages)
                 turn_index += 1
+
+    def _run_automatic_step(
+        self,
+        step: dict[str, Any],
+        attempt_dir: Path,
+        initial_prompt: str,
+    ) -> Any:
+        step_id = step["id"]
+        stdout_path = attempt_dir / "stdout.txt"
+        stderr_path = attempt_dir / "stderr.txt"
+        transcript_path = attempt_dir / "transcript.txt"
+        output_schema_path = attempt_dir / "output_schema.json"
+        last_message_path = attempt_dir / "last_message.txt"
+        request_path = attempt_dir / "exec_request.json"
+        transcript_lines: list[str] = []
+
+        output_schema_path.write_text(
+            json.dumps(step["_output_schema"], indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        command = self._normalized_command_parts(self.codex_exec_command)
+        command.extend(
+            [
+                "--full-auto",
+                "--ephemeral",
+                "--cd",
+                str(self.invocation_dir),
+                "--output-schema",
+                str(output_schema_path),
+                "--output-last-message",
+                str(last_message_path),
+            ]
+        )
+        if step.get("model"):
+            command.extend(["--model", step["model"]])
+        command.append(initial_prompt)
+
+        request_path.write_text(
+            json.dumps(
+                {
+                    "command": command,
+                    "cwd": str(self.invocation_dir),
+                    "output_schema": step["_output_schema"],
+                    "step_id": step_id,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        self._append_transcript(transcript_lines, "USER", initial_prompt)
+
+        try:
+            with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open(
+                "w", encoding="utf-8"
+            ) as stderr_handle:
+                process = subprocess.Popen(
+                    command,
+                    cwd=self.invocation_dir,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
+                stdout_thread = threading.Thread(
+                    target=self._stream_exec_output,
+                    args=(process.stdout, stdout_handle, sys.stdout),
+                    daemon=True,
+                )
+                stderr_thread = threading.Thread(
+                    target=self._stream_exec_output,
+                    args=(process.stderr, stderr_handle, sys.stderr),
+                    daemon=True,
+                )
+                stdout_thread.start()
+                stderr_thread.start()
+                return_code = process.wait()
+                stdout_thread.join()
+                stderr_thread.join()
+        except FileNotFoundError as exc:
+            raise WorkflowError(
+                f"Could not start automatic step command {command[0]}: {exc}"
+            ) from exc
+
+        if return_code != 0:
+            raise WorkflowError(
+                f"Automatic step {step_id} failed with exit code {return_code}"
+            )
+
+        try:
+            final_message = last_message_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError as exc:
+            raise WorkflowError(
+                f"Automatic step {step_id} did not produce a last message artifact"
+            ) from exc
+
+        if not final_message:
+            raise WorkflowError(f"Automatic step {step_id} returned an empty final message")
+
+        self._append_transcript(transcript_lines, "CODEX", final_message)
+        self._write_transcript(transcript_path, transcript_lines)
+
+        parsed = self._parse_json_output(final_message, step_id)
+        self._validate_output_value(
+            value=parsed,
+            shape=step["_normalized_output"],
+            path=f"steps.{step_id}.output",
+        )
+        (attempt_dir / "result.json").write_text(
+            json.dumps(parsed, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(f"Step {step_id} completed.")
+        return parsed
 
     def _normalize_output_shape(
         self,
@@ -811,16 +970,29 @@ class WorkflowRunner:
 
     def _build_initial_message(self, step: dict[str, Any], resolved_context: Any) -> str:
         lines = [f"role: {step['role']}; task: {step['prompt'].rstrip()}"]
-        lines.extend(
-            [
-                "",
-                "You are working inside an interactive workflow step.",
-                "Collaborate with the user until they decide to finalize the step.",
-                "",
-                "additional_context:",
-                json.dumps(resolved_context, indent=2, sort_keys=True),
-            ]
-        )
+        if step["_automatic"]:
+            lines.extend(
+                [
+                    "",
+                    "You are working inside an automatic workflow step.",
+                    "Complete the task in one pass and return only the final JSON object.",
+                    "Do not include markdown fences or explanatory text.",
+                    "",
+                    "additional_context:",
+                    json.dumps(resolved_context, indent=2, sort_keys=True),
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "You are working inside an interactive workflow step.",
+                    "Collaborate with the user until they decide to finalize the step.",
+                    "",
+                    "additional_context:",
+                    json.dumps(resolved_context, indent=2, sort_keys=True),
+                ]
+            )
         return "\n".join(lines)
 
     def _build_finalize_message(self, step: dict[str, Any]) -> str:
@@ -876,8 +1048,22 @@ class WorkflowRunner:
         ]
         return len(attempts) + 1
 
-    def _normalized_codex_command_parts(self) -> list[str]:
-        parts = shlex.split(self.codex_command)
+    def _stream_exec_output(
+        self,
+        stream: Any,
+        artifact_handle: Any,
+        display_handle: Any,
+    ) -> None:
+        if stream is None:
+            return
+        for raw_line in stream:
+            artifact_handle.write(raw_line)
+            artifact_handle.flush()
+            display_handle.write(raw_line)
+            display_handle.flush()
+
+    def _normalized_command_parts(self, command: str) -> list[str]:
+        parts = shlex.split(command)
         if not parts:
             raise WorkflowError("Codex command cannot be empty")
 
@@ -888,6 +1074,13 @@ class WorkflowRunner:
             parts[0] = str(executable)
 
         return parts
+
+    def _derive_exec_command(self, app_server_command: str) -> str:
+        parts = shlex.split(app_server_command)
+        if parts and parts[-1] == "app-server":
+            parts[-1] = "exec"
+            return shlex.join(parts)
+        return "codex exec"
 
     def _resolve_artifacts_root(self, artifacts_dir: str | None) -> Path:
         if artifacts_dir:
@@ -900,17 +1093,34 @@ class WorkflowRunner:
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_dir
 
+    def _print_step_header(self, step_number: int, step_id: str, automatic: bool) -> None:
+        mode = "automatic" if automatic else "interactive"
+        title = f"Step {step_number}: {step_id} ({mode})"
+        border = "=" * len(title)
+        print()
+        print(border)
+        print(title)
+        print(border)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="scripts/run_workflow.py",
-        description="Run an interactive YAML-defined Codex workflow.",
+        description="Run a YAML-defined Codex workflow with interactive and automatic steps.",
     )
     parser.add_argument("workflow_file", help="Path to the workflow YAML file")
     parser.add_argument(
         "--codex-command",
         default="codex app-server",
-        help="Command used to invoke the Codex app server",
+        help="Command used to invoke Codex app-server for interactive steps",
+    )
+    parser.add_argument(
+        "--codex-exec-command",
+        help=(
+            "Command used to invoke Codex exec for automatic steps. "
+            "Defaults to a value derived from --codex-command when possible, "
+            "otherwise `codex exec`."
+        ),
     )
     parser.add_argument(
         "--artifacts-dir",
@@ -927,6 +1137,7 @@ def main() -> int:
     runner = WorkflowRunner(
         workflow_path=args.workflow_file,
         codex_command=args.codex_command,
+        codex_exec_command=args.codex_exec_command,
         artifacts_dir=args.artifacts_dir,
     )
     return runner.run()
