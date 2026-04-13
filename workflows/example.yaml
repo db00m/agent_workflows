@@ -1,23 +1,21 @@
-version: 2
-steps:
-  - id: inspect
-    role: inspector
-    model: gpt-5-codex
-    automatic: true
-    prompt: |
-      Inspect the repository and determine whether the workflow structure looks valid.
-    output:
-      valid: boolean
-      result: string
-
-  - id: summarize
-    role: summarizer
-    prompt: |
-      Summarize the inspection result for the user.
-    additional_context:
-      valid:
-        $ref: steps.inspect.output.valid
-      text:
-        $ref: steps.inspect.output.result
-    output:
-      summary: string
+summarize:
+  role: summarizer
+  prompt: |
+    Summarize the inspection result for the user.
+  input:
+    valid:
+      $ref: inspect.output.valid
+    text:
+      $ref: inspect.output.result
+  output:
+    summary: string
+---
+inspect:
+  role: inspector
+  model: gpt-5-codex
+  interactive: false
+  prompt: |
+    Inspect the repository and determine whether the workflow structure looks valid.
+  output:
+    valid: boolean
+    result: string

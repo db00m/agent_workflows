@@ -28,15 +28,13 @@ except ModuleNotFoundError as exc:
 
 SCALAR_TYPES = {"string", "boolean", "number", "integer", "null", "any"}
 STEP_KEYS = {
-    "id",
     "role",
     "prompt",
     "model",
-    "automatic",
-    "additional_context",
+    "interactive",
+    "input",
     "output",
 }
-TOP_LEVEL_KEYS = {"version", "steps"}
 APP_SERVER_EOF = object()
 
 
@@ -362,18 +360,18 @@ class WorkflowRunner:
         self.run_dir = self._build_run_dir()
 
     def run(self) -> int:
-        workflow = self._load_workflow()
-        self._validate_workflow(workflow)
+        steps = self._load_workflow()
+        self._validate_workflow(steps)
 
         print(f"Run directory: {self.run_dir}")
 
         completed_outputs: dict[str, Any] = {}
 
-        for index, step in enumerate(workflow["steps"], start=1):
+        for index, step in enumerate(steps, start=1):
             self._print_step_header(
                 step_number=index,
                 step_id=step["id"],
-                automatic=step["_automatic"],
+                interactive=step["_interactive"],
             )
             while True:
                 try:
@@ -394,59 +392,56 @@ class WorkflowRunner:
         print("Workflow completed successfully.")
         return 0
 
-    def _load_workflow(self) -> dict[str, Any]:
+    def _load_workflow(self) -> list[dict[str, Any]]:
         try:
             with self.workflow_path.open("r", encoding="utf-8") as handle:
-                return yaml.safe_load(handle) or {}
+                documents = list(yaml.safe_load_all(handle))
         except FileNotFoundError as exc:
             raise WorkflowError(f"Workflow file not found: {self.workflow_path}") from exc
         except yaml.YAMLError as exc:
             raise WorkflowError(f"Invalid YAML in {self.workflow_path}: {exc}") from exc
+        return [document for document in documents if document is not None]
 
-    def _validate_workflow(self, workflow: dict[str, Any]) -> None:
-        if not isinstance(workflow, dict):
-            raise WorkflowError("Workflow must be a mapping")
-
-        extra_top_level = set(workflow) - TOP_LEVEL_KEYS
-        if extra_top_level:
-            keys = ", ".join(sorted(extra_top_level))
-            raise WorkflowError(f"Unsupported top-level workflow keys: {keys}")
-
-        if workflow.get("version") != 2:
-            raise WorkflowError("Workflow version must be 2")
-
-        steps = workflow.get("steps")
+    def _validate_workflow(self, steps: list[dict[str, Any]]) -> None:
         if not isinstance(steps, list) or not steps:
-            raise WorkflowError("`steps` must be a non-empty array")
-
+            raise WorkflowError("Workflow must contain at least one YAML document")
         seen_ids: set[str] = set()
         declared_outputs: dict[str, dict[str, Any]] = {}
 
-        for index, step in enumerate(steps, start=1):
+        for index, document in enumerate(steps, start=1):
+            if not isinstance(document, dict):
+                raise WorkflowError(f"Workflow document {index} must be a step mapping")
+            if len(document) != 1:
+                raise WorkflowError(
+                    f"Workflow document {index} must contain exactly one top-level step name"
+                )
+
+            step_id, step = next(iter(document.items()))
+            if not isinstance(step_id, str) or not step_id.strip():
+                raise WorkflowError(
+                    f"Workflow document {index} must use a non-empty step name as its top-level key"
+                )
             if not isinstance(step, dict):
-                raise WorkflowError("Each step must be a mapping")
+                raise WorkflowError(f"Step {step_id} must map to a step definition")
 
             extra_step_keys = set(step) - STEP_KEYS
             if extra_step_keys:
                 keys = ", ".join(sorted(extra_step_keys))
-                raise WorkflowError(f"Unsupported keys in step {index}: {keys}")
+                raise WorkflowError(f"Unsupported keys in step {step_id}: {keys}")
 
-            step_id = step.get("id")
             role = step.get("role")
             prompt = step.get("prompt")
             output = step.get("output")
-            automatic = step.get("automatic", False)
+            interactive = step.get("interactive", True)
 
-            if not isinstance(step_id, str) or not step_id.strip():
-                raise WorkflowError("Each step requires a non-empty `id`")
             if step_id in seen_ids:
-                raise WorkflowError(f"Duplicate step id: {step_id}")
+                raise WorkflowError(f"Duplicate step name: {step_id}")
             if not isinstance(role, str) or not role.strip():
                 raise WorkflowError(f"Step {step_id} requires a non-empty `role`")
             if not isinstance(prompt, str) or not prompt.strip():
                 raise WorkflowError(f"Step {step_id} requires a non-empty `prompt`")
-            if type(automatic) is not bool:
-                raise WorkflowError(f"Step {step_id} `automatic` must be a boolean")
+            if type(interactive) is not bool:
+                raise WorkflowError(f"Step {step_id} `interactive` must be a boolean")
             if output is None:
                 raise WorkflowError(f"Step {step_id} requires an `output` declaration")
 
@@ -456,20 +451,28 @@ class WorkflowRunner:
                 require_object=True,
             )
 
-            additional_context = step.get("additional_context")
-            if additional_context is not None:
-                self._validate_reference_nodes(
-                    node=additional_context,
-                    current_step_id=step_id,
-                    declared_outputs=declared_outputs,
-                    path=f"steps.{step_id}.additional_context",
-                )
-
             step["_normalized_output"] = normalized_output
             step["_output_schema"] = self._shape_to_json_schema(normalized_output)
-            step["_automatic"] = automatic
+            step["_interactive"] = interactive
+            step["_document_index"] = index
+            step["id"] = step_id
+            steps[index - 1] = step
             declared_outputs[step_id] = normalized_output
             seen_ids.add(step_id)
+
+        for step in steps:
+            step_id = step["id"]
+            step_input = step.get("input")
+            dependencies = self._collect_step_dependencies(
+                node=step_input,
+                current_step_id=step_id,
+                declared_outputs=declared_outputs,
+                path=f"steps.{step_id}.input",
+            )
+            step["_dependencies"] = dependencies
+
+        ordered_steps = self._topologically_order_steps(steps)
+        steps[:] = ordered_steps
 
     def _run_step(
         self,
@@ -485,15 +488,15 @@ class WorkflowRunner:
         attempt_dir.mkdir(parents=True, exist_ok=True)
 
         references: list[dict[str, Any]] = []
-        resolved_context = self._resolve_reference_nodes(
-            node=step.get("additional_context"),
+        resolved_input = self._resolve_reference_nodes(
+            node=step.get("input"),
             completed_outputs=completed_outputs,
-            path=f"steps.{step_id}.additional_context",
+            path=f"steps.{step_id}.input",
             references=references,
         )
 
-        (attempt_dir / "resolved_additional_context.json").write_text(
-            json.dumps(resolved_context, indent=2, sort_keys=True) + "\n",
+        (attempt_dir / "resolved_input.json").write_text(
+            json.dumps(resolved_input, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         (attempt_dir / "reference_resolution.json").write_text(
@@ -501,17 +504,17 @@ class WorkflowRunner:
             encoding="utf-8",
         )
 
-        initial_prompt = self._build_initial_message(step, resolved_context)
+        initial_prompt = self._build_initial_message(step, resolved_input)
         (attempt_dir / "initial_prompt.txt").write_text(initial_prompt, encoding="utf-8")
 
-        if step["_automatic"]:
-            return self._run_automatic_step(
+        if step["_interactive"]:
+            return self._run_interactive_step(
                 step=step,
                 attempt_dir=attempt_dir,
                 initial_prompt=initial_prompt,
             )
 
-        return self._run_interactive_step(
+        return self._run_automatic_step(
             step=step,
             attempt_dir=attempt_dir,
             initial_prompt=initial_prompt,
@@ -781,6 +784,7 @@ class WorkflowRunner:
         current_step_id: str,
         declared_outputs: dict[str, dict[str, Any]],
         path: str,
+        dependencies: set[str],
     ) -> None:
         if isinstance(node, dict):
             if "$ref" in node:
@@ -791,7 +795,10 @@ class WorkflowRunner:
                 ref_path = node["$ref"]
                 if not isinstance(ref_path, str) or not ref_path:
                     raise WorkflowError(f"{path} `$ref` must be a non-empty string")
-                self._validate_ref_path(ref_path, current_step_id, declared_outputs, path)
+                target_step_id = self._validate_ref_path(
+                    ref_path, current_step_id, declared_outputs, path
+                )
+                dependencies.add(target_step_id)
                 return
 
             for key, value in node.items():
@@ -802,6 +809,7 @@ class WorkflowRunner:
                     current_step_id=current_step_id,
                     declared_outputs=declared_outputs,
                     path=f"{path}.{key}",
+                    dependencies=dependencies,
                 )
             return
 
@@ -812,7 +820,26 @@ class WorkflowRunner:
                     current_step_id=current_step_id,
                     declared_outputs=declared_outputs,
                     path=f"{path}[{index}]",
+                    dependencies=dependencies,
                 )
+
+    def _collect_step_dependencies(
+        self,
+        node: Any,
+        current_step_id: str,
+        declared_outputs: dict[str, dict[str, Any]],
+        path: str,
+    ) -> set[str]:
+        dependencies: set[str] = set()
+        if node is not None:
+            self._validate_reference_nodes(
+                node=node,
+                current_step_id=current_step_id,
+                declared_outputs=declared_outputs,
+                path=path,
+                dependencies=dependencies,
+            )
+        return dependencies
 
     def _validate_ref_path(
         self,
@@ -820,23 +847,21 @@ class WorkflowRunner:
         current_step_id: str,
         declared_outputs: dict[str, dict[str, Any]],
         path: str,
-    ) -> None:
+    ) -> str:
         segments = ref_path.split(".")
-        if len(segments) < 3 or segments[0] != "steps" or segments[2] != "output":
+        if len(segments) < 2 or segments[1] != "output":
             raise WorkflowError(
-                f"{path} has invalid `$ref` `{ref_path}`; expected `steps.<step_id>.output...`"
+                f"{path} has invalid `$ref` `{ref_path}`; expected `<step_name>.output...`"
             )
 
-        target_step_id = segments[1]
+        target_step_id = segments[0]
         if target_step_id == current_step_id:
             raise WorkflowError(f"{path} cannot reference the current step `{current_step_id}`")
         if target_step_id not in declared_outputs:
-            raise WorkflowError(
-                f"{path} references unknown or later step `{target_step_id}`"
-            )
+            raise WorkflowError(f"{path} references unknown step `{target_step_id}`")
 
         shape = declared_outputs[target_step_id]
-        for segment in segments[3:]:
+        for segment in segments[2:]:
             if shape["type"] != "object":
                 raise WorkflowError(
                     f"{path} references `{ref_path}`, but `{segment}` does not exist on a non-object value"
@@ -847,6 +872,52 @@ class WorkflowRunner:
                     f"{path} references missing output field `{segment}` in `{ref_path}`"
                 )
             shape = properties[segment]
+        return target_step_id
+
+    def _topologically_order_steps(self, steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        step_by_id = {step["id"]: step for step in steps}
+        incoming_counts = {
+            step["id"]: len(step["_dependencies"])
+            for step in steps
+        }
+        dependents: dict[str, list[str]] = {step["id"]: [] for step in steps}
+
+        for step in steps:
+            for dependency in step["_dependencies"]:
+                dependents[dependency].append(step["id"])
+
+        ready = sorted(
+            [step["id"] for step in steps if incoming_counts[step["id"]] == 0],
+            key=lambda step_id: step_by_id[step_id]["_document_index"],
+        )
+        ordered_steps: list[dict[str, Any]] = []
+
+        while ready:
+            step_id = ready.pop(0)
+            ordered_steps.append(step_by_id[step_id])
+
+            newly_ready: list[str] = []
+            for dependent_id in dependents[step_id]:
+                incoming_counts[dependent_id] -= 1
+                if incoming_counts[dependent_id] == 0:
+                    newly_ready.append(dependent_id)
+            ready.extend(newly_ready)
+            ready.sort(key=lambda ready_id: step_by_id[ready_id]["_document_index"])
+
+        if len(ordered_steps) != len(steps):
+            blocked = sorted(
+                [
+                    step_id
+                    for step_id, count in incoming_counts.items()
+                    if count > 0
+                ]
+            )
+            raise WorkflowError(
+                "Workflow dependencies contain a cycle involving: "
+                + ", ".join(blocked)
+            )
+
+        return ordered_steps
 
     def _resolve_reference_nodes(
         self,
@@ -900,12 +971,12 @@ class WorkflowRunner:
         completed_outputs: dict[str, Any],
     ) -> Any:
         segments = ref_path.split(".")
-        step_id = segments[1]
+        step_id = segments[0]
         if step_id not in completed_outputs:
             raise WorkflowError(f"Reference `{ref_path}` has no completed output")
 
         value: Any = completed_outputs[step_id]
-        for segment in segments[3:]:
+        for segment in segments[2:]:
             if not isinstance(value, dict) or segment not in value:
                 raise WorkflowError(f"Reference `{ref_path}` did not resolve at runtime")
             value = value[segment]
@@ -968,9 +1039,9 @@ class WorkflowRunner:
         if not validators[node_type](value):
             raise WorkflowError(f"{path} must be of type `{node_type}`")
 
-    def _build_initial_message(self, step: dict[str, Any], resolved_context: Any) -> str:
+    def _build_initial_message(self, step: dict[str, Any], resolved_input: Any) -> str:
         lines = [f"role: {step['role']}; task: {step['prompt'].rstrip()}"]
-        if step["_automatic"]:
+        if not step["_interactive"]:
             lines.extend(
                 [
                     "",
@@ -978,8 +1049,8 @@ class WorkflowRunner:
                     "Complete the task in one pass and return only the final JSON object.",
                     "Do not include markdown fences or explanatory text.",
                     "",
-                    "additional_context:",
-                    json.dumps(resolved_context, indent=2, sort_keys=True),
+                    "input:",
+                    json.dumps(resolved_input, indent=2, sort_keys=True),
                 ]
             )
         else:
@@ -989,8 +1060,8 @@ class WorkflowRunner:
                     "You are working inside an interactive workflow step.",
                     "Collaborate with the user until they decide to finalize the step.",
                     "",
-                    "additional_context:",
-                    json.dumps(resolved_context, indent=2, sort_keys=True),
+                    "input:",
+                    json.dumps(resolved_input, indent=2, sort_keys=True),
                 ]
             )
         return "\n".join(lines)
@@ -1093,8 +1164,8 @@ class WorkflowRunner:
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_dir
 
-    def _print_step_header(self, step_number: int, step_id: str, automatic: bool) -> None:
-        mode = "automatic" if automatic else "interactive"
+    def _print_step_header(self, step_number: int, step_id: str, interactive: bool) -> None:
+        mode = "interactive" if interactive else "automatic"
         title = f"Step {step_number}: {step_id} ({mode})"
         border = "=" * len(title)
         print()

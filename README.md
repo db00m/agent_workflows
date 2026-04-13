@@ -3,7 +3,7 @@
 This repo contains a Python workflow runner for Codex workflows.
 
 The workflow is defined in YAML. Steps default to interactive sessions backed by
-`codex app-server`. Steps can also opt into automatic execution backed by
+`codex app-server`. Steps can also set `interactive: false` to run once via
 `codex exec`.
 
 Interactive steps let you keep talking to the step until you enter one of the
@@ -14,53 +14,53 @@ reserved workflow commands:
 - `/fail`: stop the workflow immediately
 
 When a step is finalized, the runner asks Codex to return JSON matching that
-step's declared `output` shape. Later steps can reference fields from earlier
-outputs using `$ref` inside `additional_context`.
+step's declared `output` shape. Steps can reference other steps' outputs using
+`$ref` inside `input`, and the runner builds execution order from
+those dependencies.
 
-Automatic steps do the same prompt construction and output validation, but they
-run once without the interactive `/done` loop.
+Steps with `interactive: false` use the same prompt construction and output
+validation, but run once without the interactive `/done` loop.
 
 ## Workflow YAML
 
-The top-level format is:
+The workflow file is an ordered YAML document stream. Each document is one
+step. Each document must have exactly one top-level key, and that key is the
+step name. Execution order is derived from `$ref` dependencies; file order is
+only used as a stable tie-break when steps are independent.
 
 ```yaml
-version: 2
-steps:
-  - id: inspect
-    role: inspector
-    model: gpt-5-codex
-    automatic: true
-    prompt: |
-      Inspect the repository and determine whether the workflow is valid.
-    output:
-      valid: boolean
-      result: string
-
-  - id: summarize
-    role: summarizer
-    prompt: |
-      Summarize the inspection result for the user.
-    additional_context:
-      valid:
-        $ref: steps.inspect.output.valid
-      text:
-        $ref: steps.inspect.output.result
-    output:
-      summary: string
+summarize:
+  role: summarizer
+  prompt: |
+    Summarize the inspection result for the user.
+  input:
+    valid:
+      $ref: inspect.output.valid
+    text:
+      $ref: inspect.output.result
+  output:
+    summary: string
+---
+inspect:
+  role: inspector
+  model: gpt-5-codex
+  interactive: false
+  prompt: |
+    Inspect the repository and determine whether the workflow is valid.
+  output:
+    valid: boolean
+    result: string
 ```
 
-Supported fields:
+Supported structure and fields for each step document:
 
-- `version`: currently `2`
-- `steps`: ordered list of steps
-- `steps[].id`: required unique step identifier
-- `steps[].role`: required role name
-- `steps[].prompt`: required task instructions
-- `steps[].model`: optional per-step model override
-- `steps[].automatic`: optional boolean, defaults to `false`
-- `steps[].additional_context`: optional structured context
-- `steps[].output`: required output declaration written in YAML
+- top-level key: required unique step name
+- `role`: required role name
+- `prompt`: required task instructions
+- `model`: optional per-step model override
+- `interactive`: optional boolean, defaults to `true`
+- `input`: optional structured input
+- `output`: required output declaration written in YAML
 
 Output declarations support:
 
@@ -70,18 +70,20 @@ Output declarations support:
 
 ## References
 
-References use explicit `$ref` objects:
+References use explicit `$ref` objects inside `input`:
 
 ```yaml
-additional_context:
+input:
   text:
-    $ref: steps.inspect.output.result
+    $ref: inspect.output.result
 ```
 
 Rules:
 
-- references may only target earlier steps
-- the stable reference root is `steps.<step_id>.output`
+- references may target any named step in the workflow
+- the stable reference root is `<step_name>.output`
+- execution order is determined by these references
+- cycles in the dependency graph are rejected
 - invalid references are rejected before execution starts
 
 ## Prompt And Session Behavior
@@ -89,11 +91,11 @@ Rules:
 Each step's initial message is constructed from:
 
 - `role: <role>; task: <prompt>`
-- the resolved `additional_context`
+- the resolved `input`
 
-Interactive steps are told to collaborate with the user until finalization.
-Automatic steps are told to complete the task in one pass and return only the
-final JSON object.
+Steps with `interactive: true` are told to collaborate with the user until
+finalization. Steps with `interactive: false` are told to complete the task in
+one pass and return only the final JSON object.
 
 The runner does not resolve `myteam` roles itself. The agent is expected to use
 `myteam` directly during the session if it needs role details.
@@ -106,7 +108,7 @@ directory where you launch the runner.
 For each step attempt, the runner stores:
 
 - the initial prompt
-- the resolved additional context
+- the resolved input
 - the reference resolution record
 - a human-readable transcript
 - the finalized JSON result, when the step completes
@@ -118,7 +120,7 @@ Interactive attempts also store:
 - the thread start request and response
 - each turn request
 
-Automatic attempts also store:
+Attempts for steps with `interactive: false` also store:
 
 - the exec request payload
 - the JSON Schema file passed to `codex exec`
@@ -141,7 +143,7 @@ Test with the local mocks:
 python3 scripts/run_workflow.py workflows/example.yaml --codex-command "python3 scripts/mock_codex_app_server.py" --codex-exec-command "python3 scripts/mock_codex_exec.py"
 ```
 
-Then interact with any non-automatic steps and use `/done` to advance.
+Then interact with any steps that keep `interactive: true` and use `/done` to advance.
 
 You can override the artifacts directory:
 
@@ -153,6 +155,6 @@ python3 scripts/run_workflow.py workflows/example.yaml --artifacts-dir /tmp/code
 
 - `scripts/run_workflow.py`: workflow runner
 - `scripts/mock_codex_app_server.py`: local app-server mock for interactive verification
-- `scripts/mock_codex_exec.py`: local exec mock for automatic-step verification
+- `scripts/mock_codex_exec.py`: local exec mock for `interactive: false` verification
 - `workflow_server.md`: design notes for the app-server-based workflow model
 - `workflows/example.yaml`: example workflow
